@@ -6,9 +6,6 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 
-from surprise import Dataset, Reader, SVD
-from surprise.model_selection import train_test_split
-
 
 # ──────────────────────────────────────────────
 # PAGE CONFIG
@@ -253,8 +250,25 @@ html, body, [data-testid="stAppViewContainer"] {
 RATING_SCALE = (0.5, 5.0)
 
 
+# ──────────────────────────────────────────────
+# HELPERS
+# ──────────────────────────────────────────────
+def _clip(v):
+    return float(np.clip(v, *RATING_SCALE))
+
+
+def _stars(rating: float) -> str:
+    full = int(rating)
+    half = (rating - full) >= 0.5
+    return ("★" * full) + ("½" if half else "")
+
+
+def _bar_pct(score: float) -> int:
+    return int(round((score - 0.5) / 4.5 * 100))
+
+
 # ══════════════════════════════════════════════
-# DATA + MODEL  (cached)
+# LOAD DATA
 # ══════════════════════════════════════════════
 @st.cache_data(show_spinner=False)
 def load_data():
@@ -274,123 +288,208 @@ def load_data():
     ratings["rating"]  = ratings["rating"].astype(float)
     movies["movieId"]  = movies["movieId"].astype(int)
 
+    # merge tags
     movie_tags = (
         tags.groupby("movieId")["tag"]
         .apply(lambda x: " ".join(x))
         .reset_index()
         .rename(columns={"tag": "tags_text"})
     )
+
     movies = movies.merge(movie_tags, on="movieId", how="left")
     movies["tags_text"] = movies["tags_text"].fillna("")
+
     movies["content"] = (
         movies["title"] + " " +
         movies["genres"].str.replace("|", " ", regex=False) + " " +
         movies["tags_text"]
     )
+
     return movies, ratings
 
 
+# ══════════════════════════════════════════════
+# BUILD MODELS
+# ══════════════════════════════════════════════
 @st.cache_resource(show_spinner=False)
 def build_models(_movies, _ratings):
-    tfidf        = TfidfVectorizer(stop_words="english")
+
+    # CONTENT MODEL
+    tfidf = TfidfVectorizer(stop_words="english")
     tfidf_matrix = tfidf.fit_transform(_movies["content"])
-    cosine_sim   = cosine_similarity(tfidf_matrix, tfidf_matrix)
-    id2idx       = pd.Series(_movies.index, index=_movies["movieId"]).drop_duplicates()
+    cosine_sim_content = cosine_similarity(tfidf_matrix, tfidf_matrix)
 
-    reader   = Reader(rating_scale=RATING_SCALE)
-    data     = Dataset.load_from_df(_ratings[["userId", "movieId", "rating"]], reader)
-    trainset, testset = train_test_split(data, test_size=0.2, random_state=42)
+    id2idx = pd.Series(_movies.index, index=_movies["movieId"]).drop_duplicates()
 
-    svd = SVD(n_factors=100, n_epochs=20, lr_all=0.005, reg_all=0.02, random_state=42)
-    svd.fit(trainset)
-    return cosine_sim, id2idx, svd, testset
+    # COLLABORATIVE MODEL (Item-Item similarity)
+    rating_matrix = _ratings.pivot_table(
+        index="userId",
+        columns="movieId",
+        values="rating"
+    ).fillna(0)
+
+    cosine_sim_items = cosine_similarity(rating_matrix.T)
+
+    return cosine_sim_content, id2idx, rating_matrix, cosine_sim_items
 
 
-def _clip(v):
-    return float(np.clip(v, *RATING_SCALE))
-
-
+# ══════════════════════════════════════════════
+# CONTENT PREDICT
+# ══════════════════════════════════════════════
 def content_predict(uid, mid, ratings, cosine_sim, id2idx):
-    um = ratings[ratings["userId"] == uid]
-    if um.empty:
+    user_movies = ratings[ratings["userId"] == uid]
+
+    if user_movies.empty:
         return 0.0
+
     if mid not in id2idx:
-        return float(um["rating"].mean())
-    ti = id2idx[mid]
-    ws, ss = [], []
-    for _, r in um.iterrows():
-        if r["movieId"] not in id2idx:
+        return float(user_movies["rating"].mean())
+
+    target_idx = id2idx[mid]
+
+    weighted_scores = []
+    sim_values = []
+
+    for _, row in user_movies.iterrows():
+        rated_mid = row["movieId"]
+
+        if rated_mid not in id2idx:
             continue
-        s = cosine_sim[ti][id2idx[r["movieId"]]]
-        ws.append(s * r["rating"])
-        ss.append(s)
-    tot = sum(ss)
-    return sum(ws) / tot if tot > 0 else float(um["rating"].mean())
+
+        rated_idx = id2idx[rated_mid]
+        sim = cosine_sim[target_idx][rated_idx]
+
+        weighted_scores.append(sim * row["rating"])
+        sim_values.append(sim)
+
+    total_sim = sum(sim_values)
+
+    if total_sim == 0:
+        return float(user_movies["rating"].mean())
+
+    return sum(weighted_scores) / total_sim
 
 
-def hybrid_predict(uid, mid, svd, ratings, cosine_sim, id2idx, alpha=0.4):
-    c = _clip(content_predict(uid, mid, ratings, cosine_sim, id2idx))
-    v = _clip(svd.predict(uid, mid).est)
-    return alpha * c + (1 - alpha) * v
+# ══════════════════════════════════════════════
+# COLLABORATIVE PREDICT (Item-Item)
+# ══════════════════════════════════════════════
+def collaborative_predict(uid, mid, rating_matrix, cosine_sim_items):
+    if uid not in rating_matrix.index:
+        return 0.0
+    if mid not in rating_matrix.columns:
+        return float(rating_matrix.loc[uid].replace(0, np.nan).mean())
+
+    movie_list = list(rating_matrix.columns)
+    mid_index = movie_list.index(mid)
+
+    sim_scores = cosine_sim_items[mid_index]
+    user_ratings = rating_matrix.loc[uid].values
+
+    weighted_sum = np.dot(sim_scores, user_ratings)
+    sim_sum = np.sum(np.abs(sim_scores))
+
+    if sim_sum == 0:
+        return float(rating_matrix.loc[uid].replace(0, np.nan).mean())
+
+    return weighted_sum / sim_sum
 
 
-def recommend_movies(uid, movies, ratings, cosine_sim, id2idx, svd, top_n=10, alpha=0.4):
-    seen  = set(ratings[ratings["userId"] == uid]["movieId"].values)
-    preds = [
-        (m, hybrid_predict(uid, m, svd, ratings, cosine_sim, id2idx, alpha))
-        for m in movies["movieId"].unique() if m not in seen
-    ]
+# ══════════════════════════════════════════════
+# HYBRID PREDICT
+# ══════════════════════════════════════════════
+def hybrid_predict(uid, mid, ratings, cosine_sim, id2idx,
+                   rating_matrix, cosine_sim_items, alpha=0.4):
+
+    content_score = _clip(content_predict(uid, mid, ratings, cosine_sim, id2idx))
+    collab_score  = _clip(collaborative_predict(uid, mid, rating_matrix, cosine_sim_items))
+
+    return alpha * content_score + (1 - alpha) * collab_score
+
+
+# ══════════════════════════════════════════════
+# RECOMMEND MOVIES
+# ══════════════════════════════════════════════
+def recommend_movies(uid, movies, ratings, cosine_sim, id2idx,
+                     rating_matrix, cosine_sim_items, top_n=10, alpha=0.4):
+
+    rated = set(ratings[ratings["userId"] == uid]["movieId"].values)
+    all_movies = movies["movieId"].unique()
+
+    preds = []
+    for mid in all_movies:
+        if mid in rated:
+            continue
+
+        score = hybrid_predict(uid, mid, ratings, cosine_sim, id2idx,
+                               rating_matrix, cosine_sim_items, alpha)
+        preds.append((mid, score))
+
     preds.sort(key=lambda x: x[1], reverse=True)
-    res = pd.DataFrame(preds[:top_n], columns=["movieId", "hybrid_score"])
-    res = res.merge(movies[["movieId", "title", "genres"]], on="movieId")
-    res["hybrid_score"] = res["hybrid_score"].round(3)
-    return res[["title", "genres", "hybrid_score"]]
+
+    result = pd.DataFrame(preds[:top_n], columns=["movieId", "hybrid_score"])
+    result = result.merge(movies[["movieId", "title", "genres"]], on="movieId")
+    result["hybrid_score"] = result["hybrid_score"].round(3)
+
+    return result[["title", "genres", "hybrid_score"]]
 
 
-# FIX: single loop — content computed once, reused for both content & hybrid
+# ══════════════════════════════════════════════
+# EVALUATION METRICS
+# ══════════════════════════════════════════════
 @st.cache_data(show_spinner=False)
-def compute_metrics(_testset, _svd, _ratings, _cosine_sim, _id2idx):
-    yt, yc, yv, yh = [], [], [], []
-    for pred in _svd.test(_testset):
-        uid, mid = int(pred.uid), int(pred.iid)
-        c = _clip(content_predict(uid, mid, _ratings, _cosine_sim, _id2idx))
-        v = _clip(pred.est)
+def compute_metrics(ratings, cosine_sim, id2idx, rating_matrix, cosine_sim_items):
+
+    test_df = ratings.sample(frac=0.2, random_state=42)
+
+    y_true = []
+    y_content = []
+    y_collab = []
+    y_hybrid = []
+
+    for _, row in test_df.iterrows():
+        uid = int(row["userId"])
+        mid = int(row["movieId"])
+        actual = float(row["rating"])
+
+        c = _clip(content_predict(uid, mid, ratings, cosine_sim, id2idx))
+        v = _clip(collaborative_predict(uid, mid, rating_matrix, cosine_sim_items))
         h = _clip(0.4 * c + 0.6 * v)
-        yt.append(pred.r_ui); yc.append(c); yv.append(v); yh.append(h)
 
-    def _calc(yt, yp):
-        rmse = np.sqrt(mean_squared_error(yt, yp))
-        mae  = mean_absolute_error(yt, yp)
+        y_true.append(actual)
+        y_content.append(c)
+        y_collab.append(v)
+        y_hybrid.append(h)
+
+    def _calc(y_t, y_p):
+        rmse = np.sqrt(mean_squared_error(y_t, y_p))
+        mae = mean_absolute_error(y_t, y_p)
+
+        threshold = 3.5
         tp = fp = fn = 0
-        for a, p in zip(yt, yp):
-            if   p >= 3.5 and a >= 3.5: tp += 1
-            elif p >= 3.5 and a < 3.5:  fp += 1
-            elif p < 3.5  and a >= 3.5: fn += 1
-        pr = tp / (tp + fp) if (tp + fp) else 0
-        re = tp / (tp + fn) if (tp + fn) else 0
-        f1 = 2 * pr * re / (pr + re) if (pr + re) else 0
-        return rmse, mae, pr, re, f1
 
-    return _calc(yt, yc), _calc(yt, yv), _calc(yt, yh)
+        for a, p in zip(y_t, y_p):
+            if p >= threshold and a >= threshold:
+                tp += 1
+            elif p >= threshold and a < threshold:
+                fp += 1
+            elif p < threshold and a >= threshold:
+                fn += 1
 
+        precision = tp / (tp + fp) if (tp + fp) else 0
+        recall = tp / (tp + fn) if (tp + fn) else 0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0
 
-def _stars(rating: float) -> str:
-    """Handles all half-star values correctly, including 0.5."""
-    full = int(rating)
-    half = (rating - full) >= 0.5
-    return ("★" * full) + ("½" if half else "")
+        return rmse, mae, precision, recall, f1
 
-
-def _bar_pct(score: float) -> int:
-    return int(round((score - 0.5) / 4.5 * 100))
+    return _calc(y_true, y_content), _calc(y_true, y_collab), _calc(y_true, y_hybrid)
 
 
 # ══════════════════════════════════════════════
-# LOAD
+# LOAD EVERYTHING
 # ══════════════════════════════════════════════
-with st.spinner("🎬 Loading models — first run ~30 s…"):
+with st.spinner("🎬 Loading models..."):
     movies, ratings = load_data()
-    cosine_sim, id2idx, svd, testset = build_models(movies, ratings)
+    cosine_sim, id2idx, rating_matrix, cosine_sim_items = build_models(movies, ratings)
 
 
 # ══════════════════════════════════════════════
@@ -399,7 +498,7 @@ with st.spinner("🎬 Loading models — first run ~30 s…"):
 st.markdown("""
 <div class="hero">
   <h1>🎬 CineMatch</h1>
-  <p>Hybrid Movie Recommendation · Content-Based + Collaborative Filtering (SVD)</p>
+  <p>Hybrid Movie Recommendation · Content-Based + Collaborative Filtering</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -412,8 +511,8 @@ with st.sidebar:
     st.markdown("---")
 
     selected_user = st.selectbox("👤 User ID", sorted(ratings["userId"].unique()), index=0)
-    top_n         = st.slider("🎯 Recommendations", 5, 20, 10)
-    alpha         = st.slider("⚖️ Content Weight (α)", 0.0, 1.0, 0.4, 0.05)
+    top_n = st.slider("🎯 Recommendations", 5, 20, 10)
+    alpha = st.slider("⚖️ Content Weight (α)", 0.0, 1.0, 0.4, 0.05)
 
     st.markdown(f"""
     <div class="weight-badge">
@@ -441,14 +540,16 @@ with st.sidebar:
 # ══════════════════════════════════════════════
 col_left, col_right = st.columns([3, 2], gap="large")
 
+
 # ── Recommendations ──────────────────────────
 with col_left:
     if run_btn:
         with st.spinner("Computing recommendations…"):
             recs = recommend_movies(
                 selected_user, movies, ratings,
-                cosine_sim, id2idx, svd,
-                top_n=top_n, alpha=alpha,
+                cosine_sim, id2idx,
+                rating_matrix, cosine_sim_items,
+                top_n=top_n, alpha=alpha
             )
 
         st.markdown(
@@ -458,13 +559,15 @@ with col_left:
 
         cards = ['<div class="movie-grid">']
         for rank, (_, row) in enumerate(recs.iterrows(), start=1):
-            title   = row["title"]
-            score   = row["hybrid_score"]
+            title = row["title"]
+            score = row["hybrid_score"]
             top_cls = "top3" if rank <= 3 else ""
-            pills   = "".join(
+
+            pills = "".join(
                 f'<span class="pill">{g.strip()}</span>'
                 for g in row["genres"].replace("|", ",").split(",") if g.strip()
             )
+
             cards.append(f"""
             <div class="movie-card">
               <div class="movie-rank {top_cls}">{rank:02d}</div>
@@ -479,6 +582,7 @@ with col_left:
                 </div>
               </div>
             </div>""")
+
         cards.append("</div>")
         st.markdown("".join(cards), unsafe_allow_html=True)
 
@@ -498,6 +602,7 @@ with col_right:
         f'<div class="section-title">📋 User #{selected_user} — History</div>',
         unsafe_allow_html=True,
     )
+
     user_hist = (
         ratings[ratings["userId"] == selected_user]
         .merge(movies[["movieId", "title"]], on="movieId")
@@ -526,7 +631,7 @@ with col_right:
         """, unsafe_allow_html=True)
 
         u_ratings = ratings[ratings["userId"] == selected_user]["rating"]
-        high_r    = (u_ratings >= 4.0).sum()
+        high_r = (u_ratings >= 4.0).sum()
 
         st.markdown(f"""
         <div class="metric-row">
@@ -555,15 +660,16 @@ st.markdown('<div class="section-title">📊 Model Performance</div>', unsafe_al
 with st.expander("Show evaluation metrics — 20 % test split", expanded=False):
     with st.spinner("Evaluating all models…"):
         content_m, collab_m, hybrid_m = compute_metrics(
-            testset, svd, ratings, cosine_sim, id2idx
+            ratings, cosine_sim, id2idx, rating_matrix, cosine_sim_items
         )
 
-    labels       = ["RMSE ↓", "MAE ↓", "Precision ↑", "Recall ↑", "F1 ↑"]
-    lower_better = [True,     True,    False,          False,       False]
-    model_data   = [
-        ("Content-Based",      content_m),
-        ("Collaborative (SVD)", collab_m),
-        ("Hybrid",             hybrid_m),
+    labels = ["RMSE ↓", "MAE ↓", "Precision ↑", "Recall ↑", "F1 ↑"]
+    lower_better = [True, True, False, False, False]
+
+    model_data = [
+        ("Content-Based", content_m),
+        ("Collaborative", collab_m),
+        ("Hybrid", hybrid_m),
     ]
 
     best = [
@@ -576,6 +682,7 @@ with st.expander("Show evaluation metrics — 20 % test split", expanded=False):
         f'text-align:left;font-size:.72rem;letter-spacing:.07em">{l}</th>'
         for l in ["MODEL"] + labels
     )
+
     body = ""
     for mname, mvals in model_data:
         cells = f'<td class="model-name" style="padding:.48rem .8rem">{mname}</td>'
